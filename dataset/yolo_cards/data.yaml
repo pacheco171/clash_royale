@@ -1,0 +1,5 @@
+names:
+  0: my_card
+path: C:\clash_royale\dataset\yolo_cards
+train: images/train
+val: images/val
