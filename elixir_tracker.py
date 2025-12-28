@@ -1,309 +1,359 @@
 """
 elixir_tracker.py
-Sistema completo de rastreamento de elixir do oponente
-Inclui regeneração automática e cálculo preciso
+Sistema de rastreamento de elixir do oponente
+Integrado com detecção de cartas e anti-spam
 """
 
 import time
-import json
-from typing import Dict, Optional
+from collections import deque
+from threading import Lock
+
 
 class ElixirTracker:
-    def __init__(self, cards_db_path: str = "cards_db.json"):
-        """
-        Inicializa o rastreador de elixir
-        
-        Args:
-            cards_db_path: Caminho para o arquivo com custos das cartas
-        """
-        # Configurações de elixir
-        self.max_elixir: float = 10.0
-        self.initial_elixir: float = 5.0
-        self.regen_rate: float = 1.0  # +1 elixir por segundo
-        self.double_elixir_rate: float = 2.0  # x2 Elixir
+    """Rastreia elixir do oponente baseado em cartas jogadas"""
+    
+    def __init__(self):
+        """Inicializa o rastreador de elixir"""
+        # Configurações
+        self.ELIXIR_MAX = 10
+        self.ELIXIR_START = 5  # Elixir inicial no começo da partida
+        self.REGEN_RATE = 1.0  # +1 elixir por segundo
+        self.DOUBLE_ELIXIR_RATE = 2.0  # x2 no último minuto
         
         # Estado atual
-        self.current_elixir: float = self.initial_elixir
-        self.last_update: float = time.time()
-        self.double_elixir_mode: bool = False
-        self.match_start_time: float = time.time()
+        self.opponent_elixir = self.ELIXIR_START
+        self.last_update_time = time.time()
+        self.match_start_time = time.time()
+        self.double_elixir_mode = False
         
-        # Carrega custos das cartas
-        self.card_costs: Dict[str, int] = {}
-        self._load_card_costs(cards_db_path)
+        # Histórico de jogadas (anti-spam)
+        self.recent_plays = deque(maxlen=50)
+        self.play_history = []  # Histórico completo
         
-        # Histórico de gastos
-        self.spending_history: list = []
+        # Thread safety
+        self.lock = Lock()
         
-        print(f"⚡ Elixir Tracker iniciado! Elixir inicial: {self.current_elixir}")
-    
-    def _load_card_costs(self, path: str):
-        """Carrega os custos de elixir de cada carta"""
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                cards = json.load(f)
-                for card in cards:
-                    self.card_costs[card['name'].lower()] = card['elixir']
-        except FileNotFoundError:
-            print(f"⚠️ Arquivo {path} não encontrado. Usando custos padrão.")
-            # Custos padrão de algumas cartas comuns
-            self.card_costs = {
-                'golem': 8, 'pekka': 7, 'mega knight': 7,
-                'lightning': 6, 'rocket': 6, 'elixir pump': 6,
-                'baby dragon': 4, 'wizard': 5, 'witch': 5,
-                'hog rider': 4, 'valkyrie': 4, 'mini pekka': 4,
-                'knight': 3, 'musketeer': 4, 'fireball': 4,
-                'zap': 2, 'arrows': 3, 'log': 2,
-                'skeletons': 1, 'ice spirit': 1
-            }
-    
-    def update(self):
+        # Estatísticas
+        self.total_elixir_spent = 0
+        self.play_count = 0
+        
+    def update(self, detected_cards):
         """
-        Atualiza o elixir baseado no tempo passado (regeneração)
-        Deve ser chamado constantemente (loop principal)
-        """
-        current_time = time.time()
-        time_passed = current_time - self.last_update
-        
-        # Calcula regeneração
-        regen_amount = time_passed * (
-            self.double_elixir_rate if self.double_elixir_mode 
-            else self.regen_rate
-        )
-        
-        # Atualiza elixir (max 10)
-        self.current_elixir = min(
-            self.max_elixir,
-            self.current_elixir + regen_amount
-        )
-        
-        self.last_update = current_time
-    
-    def card_played(self, card_name: str) -> Dict:
-        """
-        Registra que uma carta foi jogada e subtrai o elixir
+        Atualiza elixir baseado em cartas detectadas
         
         Args:
-            card_name: Nome da carta jogada
+            detected_cards: Lista de cartas detectadas [{'name': str, 'elixir': int, 'confidence': float}]
             
         Returns:
-            Dict com informações sobre o gasto
+            int: Elixir estimado do oponente
         """
-        # Primeiro atualiza (regeneração até agora)
-        self.update()
-        
-        # Busca custo da carta
-        cost = self.card_costs.get(card_name.lower(), 0)
-        
-        if cost == 0:
-            return {
-                'success': False,
-                'message': f'Carta {card_name} não encontrada',
-                'current_elixir': self.current_elixir
-            }
-        
-        # Subtrai o custo
-        self.current_elixir -= cost
-        
-        # Registra no histórico
-        self.spending_history.append({
-            'card': card_name,
-            'cost': cost,
-            'timestamp': time.time(),
-            'elixir_after': self.current_elixir
-        })
-        
-        # Verifica se ficou negativo (empréstimo)
-        borrowed = False
-        if self.current_elixir < 0:
-            borrowed = True
-            print(f"💸 ELIXIR NEGATIVO! Oponente pegou emprestado {abs(self.current_elixir):.1f}")
-        
-        return {
-            'success': True,
-            'card': card_name,
-            'cost': cost,
-            'current_elixir': self.current_elixir,
-            'borrowed': borrowed,
-            'borrowed_amount': abs(self.current_elixir) if borrowed else 0
-        }
+        with self.lock:
+            current_time = time.time()
+            
+            # 1. REGENERAÇÃO AUTOMÁTICA
+            time_elapsed = current_time - self.last_update_time
+            regen_rate = self.DOUBLE_ELIXIR_RATE if self.double_elixir_mode else self.REGEN_RATE
+            elixir_regenerated = time_elapsed * regen_rate
+            
+            self.opponent_elixir = min(self.ELIXIR_MAX, self.opponent_elixir + elixir_regenerated)
+            self.last_update_time = current_time
+            
+            # 2. PROCESSA CARTAS DETECTADAS (com anti-spam)
+            for card in detected_cards:
+                if not isinstance(card, dict):
+                    continue
+                
+                card_name = card.get('name', '')
+                elixir_cost = card.get('elixir', 0)
+                confidence = card.get('confidence', 0)
+                
+                # Filtra detecções com baixa confiança
+                if confidence < 0.75 or elixir_cost == 0:
+                    continue
+                
+                # ANTI-SPAM: Ignora se mesma carta foi detectada recentemente
+                if self._is_duplicate_detection(card_name, current_time):
+                    continue
+                
+                # Registra jogada
+                self._register_play(card_name, elixir_cost, confidence, current_time)
+                
+                # Subtrai elixir
+                self.opponent_elixir -= elixir_cost
+                
+                # Permite elixir negativo (empréstimo)
+                # O jogo permite gastar até 10 de elixir emprestado
+            
+            # 3. Garante que elixir não ultrapasse máximo
+            self.opponent_elixir = min(self.ELIXIR_MAX, self.opponent_elixir)
+            
+            # 4. Retorna elixir estimado (mínimo 0 para display)
+            return max(0, int(round(self.opponent_elixir)))
     
-    def get_current(self) -> float:
+    def _is_duplicate_detection(self, card_name, current_time):
         """
-        Retorna o elixir atual (com atualização automática)
-        
-        Returns:
-            Quantidade atual de elixir
-        """
-        self.update()
-        return max(0, self.current_elixir)  # Não mostra negativo
-    
-    def can_afford(self, card_name: str) -> bool:
-        """
-        Verifica se o oponente pode jogar determinada carta
+        Verifica se é uma detecção duplicada (anti-spam)
         
         Args:
             card_name: Nome da carta
+            current_time: Timestamp atual
             
         Returns:
-            True se tem elixir suficiente
+            bool: True se é duplicata
         """
-        cost = self.card_costs.get(card_name.lower(), 0)
-        return self.get_current() >= cost
+        # Janela de tempo para considerar duplicata (segundos)
+        DUPLICATE_WINDOW = 2.5
+        
+        # Verifica nas jogadas recentes
+        for play in reversed(self.recent_plays):
+            time_diff = current_time - play['timestamp']
+            
+            # Se passou tempo suficiente, não é mais duplicata
+            if time_diff > DUPLICATE_WINDOW:
+                break
+            
+            # Mesma carta dentro da janela = duplicata
+            if play['card'] == card_name:
+                return True
+        
+        return False
     
-    def get_affordable_cards(self, deck_cards: list) -> list:
-        """
-        Retorna lista de cartas que o oponente pode jogar agora
+    def _register_play(self, card_name, elixir_cost, confidence, timestamp):
+        """Registra uma jogada no histórico"""
+        play_data = {
+            'card': card_name,
+            'cost': elixir_cost,
+            'confidence': confidence,
+            'timestamp': timestamp,
+            'elixir_after': self.opponent_elixir - elixir_cost
+        }
         
-        Args:
-            deck_cards: Lista de cartas do deck (dicts com 'name' e 'elixir')
-            
-        Returns:
-            Lista de cartas que podem ser jogadas
-        """
-        current = self.get_current()
-        affordable = []
+        self.recent_plays.append(play_data)
+        self.play_history.append(play_data)
         
-        for card in deck_cards:
-            if card['elixir'] <= current:
-                affordable.append(card)
-        
-        return affordable
+        self.total_elixir_spent += elixir_cost
+        self.play_count += 1
     
     def enable_double_elixir(self):
         """Ativa modo de elixir duplo (último minuto)"""
-        self.double_elixir_mode = True
-        print("⚡⚡ MODO ELIXIR DUPLO ATIVADO! ⚡⚡")
+        with self.lock:
+            if not self.double_elixir_mode:
+                self.double_elixir_mode = True
+                print("⚡⚡ MODO ELIXIR DUPLO ATIVADO!")
     
     def disable_double_elixir(self):
         """Desativa modo de elixir duplo"""
-        self.double_elixir_mode = False
+        with self.lock:
+            self.double_elixir_mode = False
+    
+    def check_double_elixir_time(self):
+        """
+        Verifica se já passou 2 minutos de partida (elixir duplo)
+        
+        Returns:
+            bool: True se deve ativar elixir duplo
+        """
+        match_duration = time.time() - self.match_start_time
+        
+        # Elixir duplo começa aos 2 minutos (120 segundos)
+        if match_duration >= 120 and not self.double_elixir_mode:
+            self.enable_double_elixir()
+            return True
+        
+        return False
+    
+    def get_recent_plays(self, count=5):
+        """
+        Retorna últimas N jogadas
+        
+        Args:
+            count: Número de jogadas a retornar
+            
+        Returns:
+            list: Lista com últimas jogadas
+        """
+        with self.lock:
+            return list(self.recent_plays)[-count:]
+    
+    def get_elixir_spent(self):
+        """Retorna total de elixir gasto pelo oponente"""
+        with self.lock:
+            return self.total_elixir_spent
+    
+    def get_average_cost_per_play(self):
+        """Retorna custo médio por jogada"""
+        with self.lock:
+            if self.play_count == 0:
+                return 0
+            return round(self.total_elixir_spent / self.play_count, 1)
+    
+    def get_stats(self):
+        """
+        Retorna estatísticas completas
+        
+        Returns:
+            dict: Estatísticas do tracker
+        """
+        with self.lock:
+            match_duration = time.time() - self.match_start_time
+            
+            return {
+                'current_elixir': max(0, int(round(self.opponent_elixir))),
+                'total_spent': self.total_elixir_spent,
+                'play_count': self.play_count,
+                'avg_cost': self.get_average_cost_per_play(),
+                'match_duration': round(match_duration, 1),
+                'double_elixir': self.double_elixir_mode,
+                'recent_plays': self.get_recent_plays(5)
+            }
     
     def reset(self):
         """Reseta o tracker para nova partida"""
-        self.current_elixir = self.initial_elixir
-        self.last_update = time.time()
-        self.double_elixir_mode = False
-        self.match_start_time = time.time()
-        self.spending_history = []
-        print("🔄 Elixir Tracker resetado")
+        with self.lock:
+            self.opponent_elixir = self.ELIXIR_START
+            self.last_update_time = time.time()
+            self.match_start_time = time.time()
+            self.double_elixir_mode = False
+            
+            self.recent_plays.clear()
+            self.play_history = []
+            
+            self.total_elixir_spent = 0
+            self.play_count = 0
+            
+            print("🔄 Elixir Tracker resetado - Nova partida!")
     
-    def get_stats(self) -> Dict:
+    def can_afford_cards(self, deck_cards):
         """
-        Retorna estatísticas de uso de elixir
-        
-        Returns:
-            Dict com estatísticas
-        """
-        if not self.spending_history:
-            return {
-                'current_elixir': self.get_current(),
-                'total_spent': 0,
-                'avg_cost_per_play': 0
-            }
-        
-        total_spent = sum(play['cost'] for play in self.spending_history)
-        avg_cost = total_spent / len(self.spending_history)
-        
-        match_duration = time.time() - self.match_start_time
-        
-        return {
-            'current_elixir': round(self.get_current(), 1),
-            'total_spent': total_spent,
-            'total_plays': len(self.spending_history),
-            'avg_cost_per_play': round(avg_cost, 2),
-            'match_duration': round(match_duration, 1),
-            'double_elixir_mode': self.double_elixir_mode
-        }
-    
-    def get_visual_bar(self, width: int = 10) -> str:
-        """
-        Retorna uma barra visual do elixir
+        Retorna quais cartas do deck o oponente pode jogar agora
         
         Args:
-            width: Largura da barra em caracteres
+            deck_cards: Lista de cartas do deck [{'name': str, 'elixir': int}]
             
         Returns:
-            String com a barra visual
+            list: Cartas que podem ser jogadas
         """
-        current = self.get_current()
-        filled = int((current / self.max_elixir) * width)
-        empty = width - filled
-        
-        bar = "⚡" * filled + "○" * empty
-        return f"[{bar}] {current:.1f}/{self.max_elixir}"
+        with self.lock:
+            current_elixir = max(0, self.opponent_elixir)
+            affordable = []
+            
+            for card in deck_cards:
+                if isinstance(card, dict):
+                    card_elixir = card.get('elixir', 0)
+                    if card_elixir <= current_elixir:
+                        affordable.append(card)
+            
+            return affordable
     
-    def print_status(self):
-        """Imprime status atual do elixir formatado"""
-        current = self.get_current()
-        bar = self.get_visual_bar(10)
-        mode = " (2x ELIXIR)" if self.double_elixir_mode else ""
+    def get_time_until_card(self, elixir_cost):
+        """
+        Calcula tempo até oponente ter elixir para carta
         
-        print(f"\n⚡ Elixir Oponente: {bar}{mode}")
+        Args:
+            elixir_cost: Custo da carta em elixir
+            
+        Returns:
+            float: Tempo em segundos (0 se já pode jogar)
+        """
+        with self.lock:
+            elixir_needed = elixir_cost - self.opponent_elixir
+            
+            if elixir_needed <= 0:
+                return 0.0
+            
+            regen_rate = self.DOUBLE_ELIXIR_RATE if self.double_elixir_mode else self.REGEN_RATE
+            return elixir_needed / regen_rate
+    
+    def get_visual_bar(self, width=10):
+        """
+        Retorna barra visual do elixir
+        
+        Args:
+            width: Largura da barra
+            
+        Returns:
+            str: Barra formatada
+        """
+        with self.lock:
+            current = max(0, self.opponent_elixir)
+            filled = int((current / self.ELIXIR_MAX) * width)
+            empty = width - filled
+            
+            bar = "⚡" * filled + "○" * empty
+            mode = " (2x)" if self.double_elixir_mode else ""
+            
+            return f"[{bar}] {current:.1f}/10{mode}"
 
 
-# Exemplo de uso
+# Função auxiliar para usar no main.py
+def create_elixir_tracker():
+    """Cria e retorna uma nova instância do ElixirTracker"""
+    return ElixirTracker()
+
+
+# Teste do sistema
 if __name__ == "__main__":
     import random
     
     print("="*60)
-    print("🧪 TESTE DO ELIXIR TRACKER")
+    print("🧪 TESTE DO ELIXIR TRACKER COM ANTI-SPAM")
     print("="*60)
     
     tracker = ElixirTracker()
     
-    # Simula uma partida
-    test_cards = [
-        ("Golem", 8),
-        ("Baby Dragon", 4),
-        ("Night Witch", 4),
-        ("Zap", 2),
-        ("Lightning", 6)
+    # Simula detecções com spam
+    test_detections = [
+        # Golem jogado (detecções múltiplas - SPAM)
+        {'name': 'Golem', 'elixir': 8, 'confidence': 0.95},
+        {'name': 'Golem', 'elixir': 8, 'confidence': 0.93},  # DUPLICATA
+        {'name': 'Golem', 'elixir': 8, 'confidence': 0.94},  # DUPLICATA
+        
+        # Baby Dragon (detecções múltiplas - SPAM)
+        {'name': 'Baby Dragon', 'elixir': 4, 'confidence': 0.88},
+        {'name': 'Baby Dragon', 'elixir': 4, 'confidence': 0.90},  # DUPLICATA
+        
+        # Zap (carta rápida)
+        {'name': 'Zap', 'elixir': 2, 'confidence': 0.85},
     ]
     
-    print("\n📊 Simulando partida...")
+    print("\n📊 Simulando detecções com ANTI-SPAM...")
     
-    for i, (card, cost) in enumerate(test_cards, 1):
-        print(f"\n--- JOGADA {i} ---")
+    for i, detection in enumerate(test_detections, 1):
+        print(f"\n--- Detecção #{i} ---")
+        print(f"Carta: {detection['name']} ({detection['elixir']}⚡) - {detection['confidence']:.0%}")
         
-        # Simula tempo passando (1-3 segundos entre jogadas)
-        time.sleep(random.uniform(1, 3))
+        # Passa lista com uma carta
+        elixir = tracker.update([detection])
         
-        # Mostra elixir antes
-        print(f"Elixir antes: {tracker.get_current():.1f}")
-        tracker.print_status()
+        print(f"Elixir estimado: {elixir}")
+        print(tracker.get_visual_bar())
         
-        # Joga carta
-        result = tracker.card_played(card)
-        print(f"\n🃏 Jogou: {card} ({cost} elixir)")
-        
-        if result['borrowed']:
-            print(f"⚠️ Pegou emprestado {result['borrowed_amount']:.1f} de elixir!")
-        
-        # Mostra elixir depois
-        print(f"Elixir depois: {tracker.get_current():.1f}")
-        tracker.print_status()
+        # Simula tempo entre detecções
+        time.sleep(0.3)
     
-    # Simula regeneração
-    print("\n\n⏳ Esperando 5 segundos (regeneração)...")
-    time.sleep(5)
-    tracker.update()
-    tracker.print_status()
-    
-    # Ativa elixir duplo
-    print("\n\n⚡⚡ ATIVANDO ELIXIR DUPLO...")
-    tracker.enable_double_elixir()
-    
-    print("⏳ Esperando 3 segundos...")
+    # Aguarda regeneração
+    print("\n\n⏳ Aguardando 3 segundos (regeneração)...")
     time.sleep(3)
-    tracker.update()
-    tracker.print_status()
     
-    # Estatísticas finais
-    print("\n\n" + "="*60)
-    print("📊 ESTATÍSTICAS FINAIS")
+    elixir = tracker.update([])  # Atualiza sem detecções
+    print(f"Após regeneração: {elixir}")
+    print(tracker.get_visual_bar())
+    
+    # Estatísticas
+    print("\n" + "="*60)
+    print("📊 ESTATÍSTICAS")
     print("="*60)
     stats = tracker.get_stats()
-    for key, value in stats.items():
-        print(f"{key}: {value}")
+    print(f"Jogadas registradas: {stats['play_count']}")
+    print(f"Elixir total gasto: {stats['total_spent']}")
+    print(f"Custo médio: {stats['avg_cost']}⚡")
+    
+    print("\n🎯 Últimas jogadas:")
+    for play in stats['recent_plays']:
+        print(f"  • {play['card']} ({play['cost']}⚡) - {play['confidence']:.0%}")
+    
+    print("\n✅ TESTE CONCLUÍDO!")
+    print(f"Total de detecções: {len(test_detections)}")
+    print(f"Jogadas únicas registradas: {stats['play_count']}")
+    print(f"Duplicatas filtradas: {len(test_detections) - stats['play_count']}")
     print("="*60)
